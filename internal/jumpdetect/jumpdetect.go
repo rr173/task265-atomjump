@@ -35,6 +35,9 @@ func (d *Detector) loadWindows(ctx context.Context, clockID int64) ([]*model.Fre
 	if err != nil {
 		return nil, err
 	}
+	// 结果集必须 Close：Store 单连接（SetMaxOpenConns(1)），若取消或扫描出错时
+	// 直接 return 而不 Close，会占死唯一连接，导致后续查询（如窗口列表）永久阻塞。
+	defer rows.Close()
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: detect: %v", model.ErrCanceled, err)
 	}
@@ -52,16 +55,15 @@ func (d *Detector) loadWindows(ctx context.Context, clockID int64) ([]*model.Fre
 		wins = append(wins, &cp)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return nil, err
 	}
-	_ = rows.Close()
 	out := make([]*model.FreqWindow, len(wins))
 	copy(out, wins)
 	return out, nil
 }
 
-// DetectCtx 检测跳变段。结果集必须 defer Close；取消时释放连接后返回，避免占死 SQLite 单连接。
+// DetectCtx 检测跳变段。取消时立即释放窗口结果集占用的连接后返回，
+// 避免占死 SQLite 单连接导致后续查询永久阻塞。
 func (d *Detector) DetectCtx(ctx context.Context, clockID int64) ([]*model.JumpSegment, error) {
 	if ctx == nil {
 		ctx = context.Background()
