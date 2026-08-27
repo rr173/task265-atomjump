@@ -43,14 +43,19 @@ func (s *Scorer) Score(jumpID int64) ([]*model.SourceCandidate, error) {
 	return s.ScoreCtx(context.Background(), jumpID)
 }
 
-// ScoreCtx 评分。底层错误必须 %w 包装，失败时由调用方回滚半写入候选。
+// ScoreCtx 评分。底层错误必须 %w 包装；ctx 取消或候选写入失败时，清除本轮已写入的
+// 半写入候选并返回 model.ErrCanceled 包装的错误，使调用方能用 errors.Is 识别取消，
+// 且该跳变段下不留下脏证据候选。
 func (s *Scorer) ScoreCtx(ctx context.Context, jumpID int64) ([]*model.SourceCandidate, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%w: score jump %d: %v", model.ErrCanceled, jumpID, err)
+	}
 	sg, err := s.jumps.GetJump(jumpID)
 	if err != nil {
-		return nil, fmt.Errorf("score jump %d: %v", jumpID, err)
+		return nil, fmt.Errorf("score jump %d: %w", jumpID, err)
 	}
 	existing, err := s.jumps.ListCandidates(jumpID)
 	if err != nil {
@@ -86,14 +91,17 @@ func (s *Scorer) ScoreCtx(ctx context.Context, jumpID int64) ([]*model.SourceCan
 	}
 	var out []*model.SourceCandidate
 	for _, c := range cands {
+		if err := ctx.Err(); err != nil {
+			// 取消：清掉本轮已写入候选，避免幂等检查把半写入候选当成已评分。
+			_ = s.jumps.DeleteCandidatesForJump(jumpID)
+			return nil, fmt.Errorf("%w: score jump %d: %v", model.ErrCanceled, jumpID, err)
+		}
 		saved, err := s.jumps.InsertCandidate(c)
 		if err != nil {
-			return nil, fmt.Errorf("score jump %d: %v", jumpID, err)
+			_ = s.jumps.DeleteCandidatesForJump(jumpID)
+			return nil, fmt.Errorf("score jump %d: %w", jumpID, err)
 		}
 		out = append(out, saved)
-	}
-	if err := ctx.Err(); err != nil {
-		return out, fmt.Errorf("score jump %d: %v", jumpID, err)
 	}
 	return out, nil
 }
