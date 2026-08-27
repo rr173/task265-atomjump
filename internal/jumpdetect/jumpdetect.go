@@ -86,6 +86,12 @@ func (d *Detector) DetectCtx(ctx context.Context, clockID int64) ([]*model.JumpS
 	// 合并连续 jump 窗口
 	i := 0
 	for i < len(wins) {
+		if err := ctx.Err(); err != nil {
+			for _, sg := range out {
+				_ = d.jumps.DeleteJump(sg.ID)
+			}
+			return nil, fmt.Errorf("%w: detect: %v", model.ErrCanceled, err)
+		}
 		if wins[i].Status != model.WindowJump {
 			if wins[i].Status == model.WindowStable {
 				stableMean = wins[i].MeanPPB
@@ -133,6 +139,9 @@ func (d *Detector) DetectCtx(ctx context.Context, clockID int64) ([]*model.JumpS
 			Status:       "open",
 		})
 		if err != nil {
+			for _, prev := range out {
+				_ = d.jumps.DeleteJump(prev.ID)
+			}
 			return nil, err
 		}
 		out = append(out, sg)

@@ -100,6 +100,10 @@ func (b *Builder) BuildCtx(ctx context.Context, clockID int64, samples []*model.
 
 	var out []*model.FreqWindow
 	var inserted []int64
+	// rollback 本轮已插入窗口。ctx 取消或插入失败时调用，确保不留下半轮窗口。
+	rollback := func() {
+		_ = b.windows.DeleteIDs(inserted)
+	}
 	for _, k := range keys {
 		if have[k] {
 			continue
@@ -118,7 +122,7 @@ func (b *Builder) BuildCtx(ctx context.Context, clockID int64, samples []*model.
 			CreatedAt: time.Now().UTC(),
 		})
 		if err != nil {
-			_ = b.windows.DeleteIDs(inserted)
+			rollback()
 			return nil, err
 		}
 		inserted = append(inserted, win.ID)

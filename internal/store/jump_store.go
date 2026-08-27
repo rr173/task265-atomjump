@@ -70,6 +70,24 @@ func (j *JumpStore) DeleteCandidatesForJump(jumpID int64) error {
 	return err
 }
 
+// DeleteJump 在同一事务里删除跳变段及其候选，用于回滚本轮检测写入。
+// source_candidates 经外键引用 jump_segments，必须先删候选再删跳变段，
+// 否则在开启外键约束时删除跳变段会被拒绝。
+func (j *JumpStore) DeleteJump(jumpID int64) error {
+	tx, err := j.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin delete jump: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM source_candidates WHERE jump_id=?`, jumpID); err != nil {
+		return fmt.Errorf("delete candidates for jump %d: %w", jumpID, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM jump_segments WHERE id=?`, jumpID); err != nil {
+		return fmt.Errorf("delete jump %d: %w", jumpID, err)
+	}
+	return tx.Commit()
+}
+
 // InsertCandidate 写入来源候选。
 func (j *JumpStore) InsertCandidate(c *model.SourceCandidate) (*model.SourceCandidate, error) {
 	if !c.Source.Valid() {

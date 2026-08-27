@@ -99,7 +99,8 @@ func (svc *Service) AnalyzeClock(clockID int64) (*model.AnalysisResult, error) {
 }
 
 // AnalyzeClockCtx 窗口化 -> 检测 -> 评分。持时钟锁并使用 live 样本拷贝。
-// 取消时回滚本轮窗口、不推进状态；评分失败时 %w 包装且不把时钟标成 review。
+// 取消时回滚本轮窗口与跳变段、不推进状态，时钟仍停留在采集中；评分失败时
+// %w 包装且不把时钟标成 review。
 func (svc *Service) AnalyzeClockCtx(ctx context.Context, clockID int64) (*model.AnalysisResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -122,29 +123,43 @@ func (svc *Service) AnalyzeClockCtx(ctx context.Context, clockID int64) (*model.
 		svc.live.Replace(clockID, samples)
 		samples = svc.live.Snapshot(clockID)
 	}
-	before, err := svc.Store.Windows.ListByClock(clockID)
-	if err != nil {
-		return nil, err
+	// rollbackRound 回滚本轮已写入的窗口与跳变段（含候选）。
+	// 跳变段经外键引用窗口，故先删跳变段再删窗口；DeleteJump 已先删候选。
+	rollbackRound := func(wins []*model.FreqWindow, jumps []*model.JumpSegment) {
+		for _, sg := range jumps {
+			_ = svc.Store.Jumps.DeleteJump(sg.ID)
+		}
+		ids := make([]int64, 0, len(wins))
+		for _, w := range wins {
+			ids = append(ids, w.ID)
+		}
+		_ = svc.Store.Windows.DeleteIDs(ids)
 	}
-	have := map[int64]bool{}
-	for _, w := range before {
-		have[w.ID] = true
-	}
+
 	wins, err := svc.Windows.BuildCtx(ctx, clockID, samples)
 	if err != nil {
+		// BuildCtx 取消时已自清本轮窗口；此处无需再清。
 		return nil, err
 	}
 	jumps, err := svc.Detect.DetectCtx(ctx, clockID)
 	if err != nil {
+		// DetectCtx 失败（含取消）已自清本轮跳变段，但本轮窗口已落库，必须回滚。
+		rollbackRound(wins, nil)
 		return nil, err
 	}
 	scored := make([]*model.JumpSegment, 0, len(jumps))
 	for _, sg := range jumps {
 		if _, err := svc.Score.ScoreCtx(ctx, sg.ID); err != nil {
-			_ = svc.Store.Jumps.DeleteCandidatesForJump(sg.ID)
+			// 评分失败：回滚本轮全部跳变段（含已评分候选）与窗口，避免留下脏证据。
+			rollbackRound(wins, jumps)
 			return nil, fmt.Errorf("analyze score jump %d: %w", sg.ID, err)
 		}
 		scored = append(scored, sg)
+	}
+	// 推进状态前的取消检查：取消则回滚本轮、不推进，时钟仍停留在采集中。
+	if err := ctx.Err(); err != nil {
+		rollbackRound(wins, jumps)
+		return nil, fmt.Errorf("%w: analyze clock %d: %v", model.ErrCanceled, clockID, err)
 	}
 	next := model.ClockReview
 	if len(jumps) == 0 {
