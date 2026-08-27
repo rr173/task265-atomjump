@@ -97,7 +97,6 @@ func (b *Builder) BuildCtx(ctx context.Context, clockID int64, samples []*model.
 
 	var out []*model.FreqWindow
 	var inserted []int64
-	var slot model.FreqWindow
 	for _, k := range keys {
 		if err := ctx.Err(); err != nil {
 			_ = b.windows.DeleteIDs(inserted)
@@ -124,7 +123,8 @@ func (b *Builder) BuildCtx(ctx context.Context, clockID int64, samples []*model.
 			return nil, err
 		}
 		inserted = append(inserted, win.ID)
-		slot = *win
+		// 每轮新建副本再取址，否则所有元素指向同一变量，循环结束后全部被最后一窗覆盖。
+		slot := *win
 		out = append(out, &slot)
 		if status == model.WindowStable {
 			prevMean = mean
