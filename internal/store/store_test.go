@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,6 +78,52 @@ func TestSampleIdempotency(t *testing.T) {
 	}
 }
 
+// TestInsertBatchCancelReleasesConnection 复现批量上报取消后事务未回滚导致
+// 唯一写连接被占用、后续单条上报卡到 busy_timeout 超时的缺陷。
+// 修复后：取消批量返回 ErrCanceled 且事务回滚，紧随其后的单条 Insert 必须立刻成功。
+func TestInsertBatchCancelReleasesConnection(t *testing.T) {
+	st := newTestStore(t)
+	clk, _ := st.Clocks.Create("cs-batch", "cesium", 9192631770.0, false, 0)
+
+	now := time.Now().UTC()
+	batch := make([]*model.Sample, 0, 5)
+	for i := 0; i < 5; i++ {
+		batch = append(batch, &model.Sample{
+			ClockID: clk.ID, Seq: int64(i + 1), TakenAt: now.Add(time.Duration(i) * time.Second),
+			FreqHz: 9192631770.0, OffsetPPB: 0, BaselineRef: "nominal", CreatedAt: now,
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 立即取消，触发 InsertBatch 的取消路径
+
+	err := st.Samples.InsertBatch(ctx, batch)
+	if !errors.Is(err, model.ErrCanceled) {
+		t.Fatalf("batch cancel: expected ErrCanceled, got %v", err)
+	}
+
+	// 批量被取消，样本不应落库。
+	if n, _ := st.Samples.CountByClock(clk.ID); n != 0 {
+		t.Fatalf("after canceled batch, sample count = %d, want 0", n)
+	}
+
+	// 关键回归点：单条上报必须立即成功，而非卡到 busy_timeout。
+	single := &model.Sample{
+		ClockID: clk.ID, Seq: 1, TakenAt: now,
+		FreqHz: 9192631770.0, OffsetPPB: 0, BaselineRef: "nominal", CreatedAt: now,
+	}
+	done := make(chan error, 1)
+	go func() { done <- st.Samples.Insert(single) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("single insert after canceled batch: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("single insert after canceled batch timed out (connection still held by un-rolled-back tx)")
+	}
+}
+
 func TestLinkSelfLoopRejected(t *testing.T) {
 	st := newTestStore(t)
 	clk, _ := st.Clocks.Create("cs-D", "cesium", 9192631770.0, false, 0)
@@ -132,8 +180,7 @@ func TestSnapshotPublishSupersedes(t *testing.T) {
 	}
 }
 
-func TestPersistenceAcrossReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "reopen.db")
+func TestPersistenceAcrossReopen(t *testing.T) {	path := filepath.Join(t.TempDir(), "reopen.db")
 	st, err := Open(path)
 	if err != nil {
 		t.Fatalf("open: %v", err)

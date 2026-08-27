@@ -28,7 +28,8 @@ func (s *SampleStore) Insert(sm *model.Sample) error {
 	return nil
 }
 
-// InsertBatch 在同一事务中写入多条样本。ctx 取消时 Rollback，避免半批脏行占用连接。
+// InsertBatch 在同一事务中写入多条样本。ctx 取消或任一插入失败时 Rollback，
+// 释放唯一写连接，避免后续单条上报因连接被占用而卡到 busy_timeout 超时。
 func (s *SampleStore) InsertBatch(ctx context.Context, samples []*model.Sample) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -37,8 +38,10 @@ func (s *SampleStore) InsertBatch(ctx context.Context, samples []*model.Sample) 
 	if err != nil {
 		return fmt.Errorf("begin sample batch: %w", err)
 	}
+	// Commit 后 Rollback 为空操作，故所有路径都安全地回滚未提交事务。
+	defer func() { _ = tx.Rollback() }()
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("insert batch canceled: %v", err)
+		return fmt.Errorf("%w: insert batch canceled: %v", model.ErrCanceled, err)
 	}
 	for _, sm := range samples {
 		_, err := tx.Exec(
