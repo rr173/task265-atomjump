@@ -46,12 +46,20 @@ func New(s *store.Store) *Service {
 	}
 }
 
+// lockClock 返回解锁函数，并保证调用方持有时钟独占锁。
+//
+// 不同时钟的锁互相独立，可并行接入；同一时钟的上报与链路处置则共享
+// 同一个 *sync.Mutex 而互斥。clockMu 这张锁表本身的读写由 svc.mu 守护，
+// 不能在持有时钟锁的状态下回到锁表——svc.mu 只覆盖极短的 map 访问，
+// 随即释放，故不会序列化不同时钟的实际业务工作。
 func (svc *Service) lockClock(id int64) func() {
+	svc.mu.Lock()
 	m, ok := svc.clockMu[id]
 	if !ok {
 		m = &sync.Mutex{}
 		svc.clockMu[id] = m
 	}
+	svc.mu.Unlock()
 	m.Lock()
 	return m.Unlock
 }
@@ -265,7 +273,8 @@ func (svc *Service) LinkAction(linkID int64, isolate bool) (*model.CompareLink, 
 	if err != nil {
 		return nil, err
 	}
-	_ = lk
+	unlock := svc.lockClock(lk.SubjectID)
+	defer unlock()
 	status := model.LinkHealthy
 	if isolate {
 		status = model.LinkIsolated
